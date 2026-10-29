@@ -57,14 +57,18 @@ def criteria_for(nodes):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--sample", required=True, type=Path)
+    ap.add_argument("--database", required=True, type=Path,
+                    help="DuckDB containing core_sample; pilot tables are written back to this file")
     ap.add_argument("--catalogue", required=True, type=Path)
     ap.add_argument("--xlsx", required=True, type=Path)
-    ap.add_argument("--duckdb", required=True, type=Path)
     ap.add_argument("--revision", required=True, help="Pinned Hugging Face commit SHA")
     args = ap.parse_args()
 
-    companies = read_csv(args.sample)
+    input_db = duckdb.connect(str(args.database), read_only=True)
+    cursor = input_db.execute("SELECT * FROM core_sample")
+    sample_columns = [column[0] for column in cursor.description]
+    companies = [dict(zip(sample_columns, row)) for row in cursor.fetchall()]
+    input_db.close()
     catalogue_rows = read_csv(args.catalogue)
     nodes = {r["CODE"]: r for r in catalogue_rows}
     children = defaultdict(list)
@@ -261,24 +265,12 @@ def main():
             print(f"ladder: {idx}/{len(companies)}; swap={swap_usage()}; mps_allocated={torch.mps.current_allocated_memory() if device == 'mps' else 0}", flush=True)
 
     elapsed_total = time.perf_counter() - run_started
-    args.duckdb.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(args.duckdb))
-    con.execute("CREATE OR REPLACE TABLE results(uid VARCHAR, arm VARCHAR, level VARCHAR, options JSON, probabilities JSON, choice VARCHAR, answer_confidence DOUBLE, seconds DOUBLE, error VARCHAR)")
-    con.executemany("INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [
-        (r["uid"], r["arm"], r["level"], json.dumps(r["options"]), json.dumps(r["probabilities"]),
-         r["choice"], r["answer_confidence"], r["seconds"], r["error"]) for r in raw])
-    con.execute("CREATE OR REPLACE TABLE run_metadata(key VARCHAR, value VARCHAR)")
-    con.executemany("INSERT INTO run_metadata VALUES (?, ?)", [("revision", args.revision), ("device", device),
-       ("chosen_arm", chosen_arm), ("elapsed_seconds", str(elapsed_total)), ("load_seconds", str(load_seconds)),
-       ("warmup_seconds", str(warmup_seconds))])
-    con.close()
-
     headers = ["UID", "COMPANY_NAME", "REGISTER_PURPOSE", "DETECTED_LANGUAGE"]
     for level in LEVELS:
         headers += [f"LAYA_{level.upper()}_CODE", f"LAYA_{level.upper()}_LABEL_EN", f"LAYA_{level.upper()}_CONFIDENCE"]
     headers += ["TOP2_ALTERNATIVE", "CORTEX_NOGA2025_CODE", "CORTEX_NOGA2025_SECTION", "NOGA2008_GROUP",
                 "NOGA2008_GROUP_LABEL", "section_agrees_cortex", "type_agrees_cortex"] + REVIEW_COLUMNS
-    wb = Workbook(); ws = wb.active; ws.title = "review"; ws.append(headers)
+    review_rows = []
     for company in companies:
         row = by_uid[company["UID"]]
         vals = [company.get("UID"), company.get("COMPANY_NAME"), company.get("REGISTER_PURPOSE"), row.get("language", "unknown")]
@@ -292,17 +284,12 @@ def main():
                  company.get("NOGA2008_GROUP"), company.get("NOGA2008_GROUP_LABEL"),
                  _agreement(row["arms"].get(chosen_arm), company.get("NOGA2025_SECTION")),
                  _agreement(row["levels"].get("type"), company.get("NOGA2025_CODE"))] + [None] * len(REVIEW_COLUMNS)
-        ws.append(vals)
-    for cell in ws[1]: cell.font = Font(bold=True)
-    for column in ws.iter_cols():
-        if column[0].value and ("CODE" in str(column[0].value) or column[0].value in ("UID", "NOGA2008_GROUP")):
-            for cell in column[1:]: cell.number_format = "@"
-    summary = wb.create_sheet("summary")
-    summary.append(["metric", "value"])
-    summary.append(["companies", len(companies)]); summary.append(["no_purpose", sum(not (c.get("REGISTER_PURPOSE") or "").strip() for c in companies)])
-    summary.append(["chosen_section_arm", chosen_arm])
-    for arm, count in comparisons.items(): summary.append([f"section_agreement_{arm}", f"{count}/{len(companies)}"])
-    summary.append(["language_counts", json.dumps(dict(Counter(by_uid[c["UID"]].get("language", "unknown") for c in companies)))])
+        review_rows.append(vals)
+    summary_rows = [["metric", "value"]]
+    summary_rows.append(["companies", len(companies)]); summary_rows.append(["no_purpose", sum(not (c.get("REGISTER_PURPOSE") or "").strip() for c in companies)])
+    summary_rows.append(["chosen_section_arm", chosen_arm])
+    for arm, count in comparisons.items(): summary_rows.append([f"section_agreement_{arm}", f"{count}/{len(companies)}"])
+    summary_rows.append(["language_counts", json.dumps(dict(Counter(by_uid[c["UID"]].get("language", "unknown") for c in companies)))])
     for level in LEVELS:
         counts = Counter()
         for company in companies:
@@ -316,41 +303,73 @@ def main():
             if pred and not pred.get("error") and expected and str(pred.get("choice")) == str(expected):
                 counts["agree"] += 1
         low, high = wilson(counts["agree"], len(companies))
-        summary.append([f"{level}_agreement_cortex_wilson95", json.dumps({"agree": counts["agree"], "denominator": len(companies), "low": low, "high": high})])
+        summary_rows.append([f"{level}_agreement_cortex_wilson95", json.dumps({"agree": counts["agree"], "denominator": len(companies), "low": low, "high": high})])
         failures = sum(not (by_uid[c["UID"]]["levels"].get(level) and
                             not by_uid[c["UID"]]["levels"][level].get("error")) for c in companies)
-        summary.append([f"{level}_failures_no_purpose_in_denominator", json.dumps({"failures": failures, "no_purpose": sum(not (c.get("REGISTER_PURPOSE") or "").strip() for c in companies), "denominator": len(companies)})])
-        summary.append([f"{level}_confidence_distribution", json.dumps({k: v for k, v in counts.items() if k.startswith("confidence_")})])
+        summary_rows.append([f"{level}_failures_no_purpose_in_denominator", json.dumps({"failures": failures, "no_purpose": sum(not (c.get("REGISTER_PURPOSE") or "").strip() for c in companies), "denominator": len(companies)})])
+        summary_rows.append([f"{level}_confidence_distribution", json.dumps({k: v for k, v in counts.items() if k.startswith("confidence_")})])
         level_times = [r["seconds"] for r in raw if r["arm"] == "greedy" and r["level"] == level and r["seconds"] > 0]
-        summary.append([f"{level}_greedy_call_timing_seconds", json.dumps({"calls": len(level_times),
+        summary_rows.append([f"{level}_greedy_call_timing_seconds", json.dumps({"calls": len(level_times),
             "mean": statistics.mean(level_times) if level_times else None,
             "median": statistics.median(level_times) if level_times else None})])
     top2_types = {uid: row["alternatives"].get("type", []) for uid, row in by_uid.items()}
     top2_matches = sum(any(str(code) == str(company.get("NOGA2025_CODE")) for code in top2_types[company["UID"]])
                        for company in companies)
     top2_low, top2_high = wilson(top2_matches, len(companies))
-    summary.append(["top2_type_agreement_cortex_wilson95", json.dumps({"agree": top2_matches,
+    summary_rows.append(["top2_type_agreement_cortex_wilson95", json.dumps({"agree": top2_matches,
         "denominator": len(companies), "low": top2_low, "high": top2_high,
         "rows_with_type_path": sum(bool(v) for v in top2_types.values())})])
-    summary.append(["top2_prediction_calls", sum(r["arm"] == "top2" and r["seconds"] > 0 for r in raw)])
+    summary_rows.append(["top2_prediction_calls", sum(r["arm"] == "top2" and r["seconds"] > 0 for r in raw)])
     prediction_calls = [r for r in raw if r["seconds"] > 0 and
                         not (r["arm"] == "S2_EN_ROT" and r["level"] == "section")]
-    summary.append(["actual_prediction_calls", len(prediction_calls)])
-    summary.append(["actual_prediction_mean_seconds", statistics.mean(r["seconds"] for r in prediction_calls)])
+    summary_rows.append(["actual_prediction_calls", len(prediction_calls)])
+    summary_rows.append(["actual_prediction_mean_seconds", statistics.mean(r["seconds"] for r in prediction_calls)])
     for arm in ("S1_EN", "S2_EN_ROT", "S3_DE"):
         samples = [r["seconds"] for r in raw if r["arm"] == arm and
                    (r["level"] == "section" if arm != "S2_EN_ROT" else r["level"].startswith("section_rotation_"))]
-        summary.append([f"{arm}_call_timing_seconds", json.dumps({"calls": len(samples),
+        summary_rows.append([f"{arm}_call_timing_seconds", json.dumps({"calls": len(samples),
             "mean": statistics.mean(samples) if samples else None,
             "median": statistics.median(samples) if samples else None})])
-    summary.append(["per_company_seconds", elapsed_total / len(companies)])
-    summary.append(["load_seconds", load_seconds]); summary.append(["warmup_seconds", warmup_seconds])
-    summary.append(["peak_rss_bytes", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss])
-    summary.append(["mps_allocated_bytes", torch.mps.current_allocated_memory() if device == "mps" else None])
-    summary.append(["mps_driver_bytes", torch.mps.driver_allocated_memory() if device == "mps" else None])
-    summary.append(["swap_usage", swap_usage()])
-    summary.append(["extrapolated_1_1m_seconds", elapsed_total / len(companies) * 1100000])
-    summary.append(["checkpoint_revision", args.revision]); summary.append(["device", device]); summary.append(["total_seconds", elapsed_total])
+    summary_rows.append(["per_company_seconds", elapsed_total / len(companies)])
+    summary_rows.append(["load_seconds", load_seconds]); summary_rows.append(["warmup_seconds", warmup_seconds])
+    summary_rows.append(["peak_rss_bytes", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss])
+    summary_rows.append(["mps_allocated_bytes", torch.mps.current_allocated_memory() if device == "mps" else None])
+    summary_rows.append(["mps_driver_bytes", torch.mps.driver_allocated_memory() if device == "mps" else None])
+    summary_rows.append(["swap_usage", swap_usage()])
+    summary_rows.append(["extrapolated_1_1m_seconds", elapsed_total / len(companies) * 1100000])
+    summary_rows.append(["checkpoint_revision", args.revision]); summary_rows.append(["device", device]); summary_rows.append(["total_seconds", elapsed_total])
+    con = duckdb.connect(str(args.database))
+    con.execute("CREATE OR REPLACE TABLE laya_calls(uid VARCHAR, arm VARCHAR, level VARCHAR, options JSON, probabilities JSON, choice VARCHAR, answer_confidence DOUBLE, timing_seconds DOUBLE, error VARCHAR)")
+    con.executemany("INSERT INTO laya_calls VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+        (r["uid"], r["arm"], r["level"], json.dumps(r["options"]), json.dumps(r["probabilities"]),
+         r["choice"], r["answer_confidence"], r["seconds"], r["error"]) for r in raw])
+    result_types = ["DOUBLE" if "_CONFIDENCE" in header else "VARCHAR" for header in headers]
+    con.execute("CREATE OR REPLACE TABLE laya_result(%s)" % ", ".join(
+        '"%s" %s' % (header.replace('"', '""'), typ) for header, typ in zip(headers, result_types)))
+    placeholders = ", ".join("?" for _ in headers)
+    con.executemany("INSERT INTO laya_result VALUES (%s)" % placeholders, review_rows)
+    con.execute("CREATE OR REPLACE TABLE laya_summary(ordinal INTEGER, metric VARCHAR, value VARCHAR)")
+    con.executemany("INSERT INTO laya_summary VALUES (?, ?, ?)", [
+        (i, str(row[0]), None if row[1] is None else str(row[1])) for i, row in enumerate(summary_rows)])
+    con.execute("DELETE FROM sources WHERE table_name IN ('laya_calls', 'laya_result', 'laya_summary')")
+    con.executemany("INSERT INTO sources VALUES (?, ?, ?)", [
+        ("laya_calls", "Laya pilot raw choice options, probabilities, choices, confidence, and timing", "noga_laya.duckdb"),
+        ("laya_result", "Laya pilot company-level review output", "noga_laya.duckdb"),
+        ("laya_summary", "Laya pilot aggregate counts and runtime measurements", "noga_laya.duckdb")])
+
+    wb = Workbook()
+    ws = wb.active; ws.title = "review"; ws.append(headers)
+    for result_row in con.execute("SELECT * FROM laya_result ORDER BY UID").fetchall():
+        ws.append(list(result_row))
+    for cell in ws[1]: cell.font = Font(bold=True)
+    for column in ws.iter_cols():
+        if column[0].value and ("CODE" in str(column[0].value) or column[0].value in ("UID", "NOGA2008_GROUP")):
+            for cell in column[1:]: cell.number_format = "@"
+    summary = wb.create_sheet("summary")
+    summary.append(["metric", "value"])
+    for _, metric, value in con.execute("SELECT ordinal, metric, value FROM laya_summary ORDER BY ordinal").fetchall():
+        summary.append([metric, value])
+    con.close()
     args.xlsx.parent.mkdir(parents=True, exist_ok=True); wb.save(args.xlsx)
     print(json.dumps({"n": len(companies), "elapsed_seconds": elapsed_total, "load_seconds": load_seconds,
         "warmup_seconds": warmup_seconds, "device": device, "chosen_arm": chosen_arm, "section_agreement": comparisons,
