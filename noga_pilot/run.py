@@ -55,6 +55,102 @@ def criteria_for(nodes):
     return dict(zip(keys, (nodes[c]["LABEL_EN"] for c in codes))), dict(zip(keys, codes))
 
 
+def _ranked_paths(paths):
+    """Keep the two most likely paths; ties use the NOGA code for repeatability."""
+    return sorted(paths, key=lambda path: (-path["score"], path["code"]))[:2]
+
+
+def section_rotations(predict, purpose, names, section_map):
+    """Run every S2 order and fail the aggregate if any rotation fails."""
+    rotations, errors = [], []
+    for shift in range(len(names)):
+        question = {f"r{shift}": {"type": "choice", "instructions": QUESTION, "criteria": names,
+                                  "option_order": [(p + shift) % len(names) for p in range(len(names))]}}
+        started = time.perf_counter()
+        try:
+            answer = predict(purpose, question, f"r{shift}")
+            mapping = dict(zip(names, section_map.values()))
+            probabilities = {mapping[key]: value for key, value in answer.get("probabilities", {}).items()}
+            choice = mapping.get(answer.get("choice"))
+            elapsed = time.perf_counter() - started
+            rotations.append((probabilities, elapsed))
+            if not choice:
+                errors.append("invalid_child")
+            raw = {"options": list(section_map.values()), "probabilities": probabilities, "choice": choice,
+                   "answer_confidence": answer.get("answer_confidence"), "seconds": elapsed,
+                   "error": None if choice else "invalid_child"}
+        except Exception as exc:
+            elapsed = time.perf_counter() - started
+            error = f"{type(exc).__name__}: {exc}"
+            errors.append(error)
+            raw = {"options": list(section_map.values()), "probabilities": {}, "choice": None,
+                   "answer_confidence": None, "seconds": elapsed, "error": error}
+        yield shift, raw, rotations, errors
+
+
+def top2_paths(uid, purpose, section_record, children, infer):
+    """Explore at most two paths, branching on uncertain sections and divisions."""
+    probabilities = section_record.get("probabilities") or {}
+    sections = sorted(probabilities.items(), key=lambda item: (-item[1], item[0]))
+    if len(sections) < 2:
+        return []
+    section_uncertain = sections[0][1] - sections[1][1] < 0.15
+    greedy_section = section_record.get("choice")
+    if section_uncertain:
+        starts = sections[:2]
+    else:
+        starts = [next((entry for entry in sections if entry[0] == greedy_section), sections[0])]
+    paths = [{"code": code, "score": prob, "lineage": [("section", code)]}
+             for code, prob in starts]
+    for path in paths:
+        choices = children.get(path["code"], [])
+        if not choices:
+            path["error"] = True
+            continue
+        if len(choices) == 1:
+            path["division_options"] = [(choices[0], 1.0)]
+            continue
+        rec = infer(uid, "top2", "division", purpose, path["lineage"], choices)
+        if rec["error"] or not rec["choice"]:
+            path["error"] = True
+            continue
+        divisions = sorted(rec["probabilities"].items(), key=lambda item: (-item[1], item[0]))
+        fork = len(divisions) > 1 and divisions[0][1] - divisions[1][1] < 0.15
+        path["division_options"] = divisions[:2] if fork else divisions[:1]
+    expanded = []
+    for path in paths:
+        for code, prob in path.pop("division_options", []):
+            expanded.append({"code": code, "score": path["score"] * prob,
+                             "lineage": path["lineage"] + [("division", code)]})
+    paths = _ranked_paths(expanded)
+    for level in LEVELS[2:]:
+        next_paths = []
+        for path in paths:
+            choices = children.get(path["code"], [])
+            if not choices:
+                continue
+            if len(choices) == 1:
+                rec = {"choice": choices[0], "answer_confidence": 1.0, "error": None}
+            else:
+                rec = infer(uid, "top2", level, purpose, path["lineage"], choices)
+            if rec["error"] or not rec["choice"]:
+                continue
+            prob = (rec.get("probabilities") or {}).get(rec["choice"], 1.0)
+            next_paths.append({"code": rec["choice"], "score": path["score"] * prob,
+                               "lineage": path["lineage"] + [(level, rec["choice"])]})
+        paths = _ranked_paths(next_paths)
+    return [path["code"] for path in paths if path["lineage"][-1][0] == "type"]
+
+
+def top2_trigger(section_record, division_record):
+    margins = []
+    for record in (section_record, division_record):
+        values = sorted((record or {}).get("probabilities", {}).values(), reverse=True)
+        if len(values) > 1:
+            margins.append(values[0] - values[1])
+    return any(margin < 0.15 for margin in margins)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--database", required=True, type=Path,
@@ -132,34 +228,24 @@ def main():
         for arm, names in (("S1_EN", section_options), ("S2_EN_ROT", section_options),
                            ("S3_DE", {k: nodes[v]["LABEL_DE"] for k, v in section_map.items()})):
             if arm == "S2_EN_ROT":
-                rotations = []
-                for shift in range(len(section_options)):
-                    q = {f"r{shift}": {"type": "choice", "instructions": QUESTION,
-                                       "criteria": names,
-                                       "option_order": [(p + shift) % len(section_options)
-                                                        for p in range(len(section_options))]}}
-                    start = time.perf_counter()
-                    response = router.predict(purpose, q, model="multilingual", max_len=1024,
-                                              head_max_len=512)
-                    elapsed = time.perf_counter() - start
-                    answer = response["answers"][f"r{shift}"]
-                    mapping = dict(zip(names, section_map))
-                    probs = {mapping[k]: v for k, v in answer.get("probabilities", {}).items()}
-                    rotations.append((probs, elapsed))
-                    rotation_code = mapping.get(answer["choice"])
-                    raw.append({"uid": uid, "arm": arm, "level": f"section_rotation_{shift:02d}",
-                                "options": list(section_map.values()), "probabilities": probs,
-                                "choice": rotation_code, "answer_confidence": answer.get("answer_confidence"),
-                                "seconds": elapsed, "error": None if rotation_code else "invalid_child"})
-                averaged = {code: statistics.mean(p.get(code, 0.0) for p, _ in rotations)
-                            for code in section_map.values()}
-                code = max(averaged, key=averaged.get)
+                rotations, rotation_errors = [], []
+                def predict_rotation(_purpose, question, key):
+                    return router.predict(_purpose, question, model="multilingual", max_len=1024,
+                                          head_max_len=512)["answers"][key]
+                for shift, rotation, rotations, rotation_errors in section_rotations(
+                        predict_rotation, purpose, names, section_map):
+                    raw.append({"uid": uid, "arm": arm, "level": f"section_rotation_{shift:02d}", **rotation})
+                averaged = ({code: statistics.mean(p.get(code, 0.0) for p, _ in rotations)
+                             for code in section_map.values()} if not rotation_errors else {})
+                code = max(averaged, key=averaged.get) if averaged else None
                 rec = {"uid": uid, "arm": arm, "level": "section", "options": list(section_map.values()),
-                       "probabilities": averaged, "choice": code, "answer_confidence": averaged[code],
-                       "seconds": sum(t for _, t in rotations), "error": None}
+                       "probabilities": averaged, "choice": code,
+                       "answer_confidence": averaged.get(code) if code else None,
+                       "seconds": sum(t for _, t in rotations),
+                       "error": "; ".join(rotation_errors) if rotation_errors else None}
                 raw.append(rec)
             else:
-                mapping = dict(zip(names, section_map))
+                mapping = dict(zip(names, section_map.values()))
                 t0 = time.perf_counter()
                 try:
                     answer = router.predict(purpose, {"pick": {"type": "choice", "instructions": QUESTION,
@@ -217,50 +303,10 @@ def main():
             ancestors.append((level, path))
         row["levels"]["section"] = dict(row["arms"][chosen_arm])
         # Margin-triggered alternate section path is separate from the greedy result.
-        top = sorted(row["arms"][chosen_arm]["probabilities"].items(), key=lambda kv: kv[1], reverse=True)
-        if len(top) > 1 and top[0][1] - top[1][1] < 0.15:
-            branches = [code for code, _ in top[:2]]
-            complete_paths = []
-            for branch in branches:
-                parent, lineage = branch, [("section", branch)]
-                for level in LEVELS[1:]:
-                    candidates = children.get(parent, [])
-                    if not candidates:
-                        break
-                    if len(candidates) == 1:
-                        code = candidates[0]
-                        rec = {"uid": uid, "arm": "top2", "level": level, "options": candidates,
-                               "probabilities": {code: 1.0}, "choice": code, "answer_confidence": 1.0,
-                               "seconds": 0.0, "error": None, "single_child": True}
-                        raw.append(rec)
-                    else:
-                        rec = infer(uid, "top2", level, purpose, lineage, candidates)
-                    if rec["error"]:
-                        break
-                    parent = rec["choice"]
-                    lineage.append((level, parent))
-                    if level == "division" and len(rec["probabilities"]) > 1:
-                        division_choices = sorted(rec["probabilities"].items(), key=lambda kv: kv[1], reverse=True)
-                        if division_choices[0][1] - division_choices[1][1] < 0.15:
-                            # The other division is retained as the second path; later levels are run below.
-                            alternative = division_choices[1][0]
-                            alt_lineage = lineage[:-1] + [("division", alternative)]
-                            alt_parent = alternative
-                            for later_level in LEVELS[2:]:
-                                later = children.get(alt_parent, [])
-                                if not later:
-                                    break
-                                later_rec = infer(uid, "top2", later_level, purpose, alt_lineage, later) if len(later) > 1 else None
-                                if later_rec and later_rec["error"]:
-                                    break
-                                alt_parent = later_rec["choice"] if later_rec else later[0]
-                                alt_lineage.append((later_level, alt_parent))
-                            if alt_lineage[-1][0] == "type":
-                                complete_paths.append(alt_lineage[-1][1])
-                    
-                if lineage[-1][0] == "type":
-                    complete_paths.append(lineage[-1][1])
-            row["alternatives"]["type"] = complete_paths[:2]
+        greedy_division = row["levels"].get("division")
+        if top2_trigger(row["arms"][chosen_arm], greedy_division):
+            row["alternatives"]["type"] = top2_paths(uid, purpose, row["arms"][chosen_arm],
+                                                       children, infer)
         if idx % 10 == 0:
             print(f"ladder: {idx}/{len(companies)}; swap={swap_usage()}; mps_allocated={torch.mps.current_allocated_memory() if device == 'mps' else 0}", flush=True)
 
