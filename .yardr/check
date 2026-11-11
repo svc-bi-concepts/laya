@@ -1,0 +1,42 @@
+#!/bin/sh
+gate_slot=$HOME/ws_yardr/integrations/gate-slot.sh
+if [ -z "${YARD_GATE_SLOT_HELD:-}" ] && [ -f "$gate_slot" ]; then exec sh "$gate_slot" -- sh "$0" "$@"; fi
+# Gate for laya on the Mac mini: the weight-free, offline part of the test suite.
+#
+# What .github/workflows/ci.yml runs in its `test` and `evals` jobs (Actions are off on this
+# fork, laya-eqr9), once, on Python 3.11 with CPU torch:
+#   1. the AGENTS.md lint and compile gates (ruff's error subset, compileall);
+#   2. scripts/test_suites.py, the one suite list CI and the release gate share, with the
+#      extras CI installs for it (mcp, serve, langchain: without them those suites skip
+#      themselves and pass, and test_langchain_real_mode.py fails);
+#   3. the zh_short_commands benchmark tests of the same `test` job;
+#   4. the evals job's suites that need no onnx: test_evals.py, test_evals_agreement.py
+#      (also on the list), test_evals_shortlist.py, test_evals_api.py;
+#   5. tests/test_noga_pilot.py, this yard's NOGA pilot traversal (not on the upstream list).
+# None of these loads checkpoint weights or reaches the network once uv has the wheels.
+#
+# Left out (the rest of tests/):
+#   real checkpoints or a model download: test_local_e2e.py, test_mcp_local_e2e.py,
+#     test_server_example.py
+#   CUDA or TileLang: test_fast.py, test_fast_cpu.py, test_compile_cuda.py
+#   the onnx extra: test_onnx.py, test_onnx_quantize.py, test_onnx_export_batch.py,
+#     test_evals_onnx.py
+#   the Docker image: test_docker_torch.py (docker.yml runs it inside laya:smoke)
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+# Bytecode into the temp dir and no .pytest_cache: the gate leaves the tree as it found it.
+export PYTHONPYCACHEPREFIX="$tmp/pycache" PYTEST_ADDOPTS="-p no:cacheprovider"
+
+uvx --quiet ruff check --no-cache laya/ --select=E9,F63,F7,F82,F401,F811 --line-length=120
+
+# One throwaway env for the run; editable so the suites test this checkout.
+py() { uv run --quiet --no-project --python 3.11 --with-editable '.[mcp,serve,langchain]' --with httpx --with pytest python "$@"; }
+py -m compileall -q laya/ tests/
+py scripts/test_suites.py
+py -m unittest discover -s research/benchmarks/zh_short_commands/tests
+py -m pytest -q tests/test_evals.py tests/test_evals_shortlist.py tests/test_noga_pilot.py
+py tests/test_evals_api.py
+echo "gate: ok"

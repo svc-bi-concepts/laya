@@ -1,0 +1,6 @@
+# Per-repo no-mistakes overrides.
+
+# Pin the Test step to the repository's own gate command, the one the yard's landing runs too
+# (`sh .yardr/check`), so a pipeline validation and a landing cannot disagree about what passes.
+commands:
+  test: "sh .yardr/check"
