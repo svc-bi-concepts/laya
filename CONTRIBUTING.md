@@ -77,6 +77,7 @@ The suites that need hardware, a compiler or local weights are not part of the P
 - `tests/test_fast_cpu.py` -- needs the `tilelang` extra and a C++ compiler; its CUDA parity checks skip.
 - `tests/test_local_e2e.py` -- expects checkpoints under `~/laya_models`.
 - `tests/test_mcp_local_e2e.py` -- expects checkpoints under `~/laya_models` and the `mcp` extra.
+- `tests/test_noga_pilot.py` -- tests the yard-local NOGA pilot in `noga_pilot/`, which is not part of the laya package; needs `duckdb` and `openpyxl`, which `pyproject.toml` does not declare.
 - `tests/test_onnx.py` -- needs the `onnx` extra; it runs in the ONNX lane of `evals.yml`, not the PR job.
 - `tests/test_server_example.py` -- needs the weights `examples/server.py` loads; it runs in `evals.yml`.
 

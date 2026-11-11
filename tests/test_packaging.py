@@ -449,6 +449,7 @@ EXEMPT_TEST_SUITES = {
     "test_fast_cpu.py": "Requires tilelang extra and a C++ compiler; optional CUDA parity",
     "test_compile_cuda.py": "Requires CUDA; CI installs CPU-only torch",
     "test_server_example.py": "Requires cached or downloaded weights for examples/server.py",
+    "test_noga_pilot.py": "yard-local NOGA pilot, not part of the laya package; needs duckdb/openpyxl",
 }
 
 all_test_files = [
