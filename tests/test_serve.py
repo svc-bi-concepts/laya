@@ -3804,7 +3804,9 @@ def test_idle_window_starts_after_worker_finishes_even_on_cancel_or_failure(monk
     import time
     from concurrent.futures import ThreadPoolExecutor
 
-    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "0.2")
+    # Timings are wide on purpose: at load 40-50 a 0.2 s window left too little slack
+    # between the worker finishing and the reaper, and the test failed on scheduling.
+    monkeypatch.setenv("LAYA_IDLE_UNLOAD_SECONDS", "1.0")
     monkeypatch.delenv("LAYA_API_KEY", raising=False)
 
     class BlockingRouter(IdleRouter):
@@ -3819,7 +3821,7 @@ def test_idle_window_starts_after_worker_finishes_even_on_cancel_or_failure(monk
             self.active = True
             self.started.set()
             try:
-                assert self.release.wait(3.0)
+                assert self.release.wait(10.0)
                 if fail:
                     raise ValueError("test failure")
                 return super().predict(*args, **kwargs)
@@ -3843,17 +3845,17 @@ def test_idle_window_starts_after_worker_finishes_even_on_cancel_or_failure(monk
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
                     task = asyncio.create_task(client.post(path, json=body))
                     try:
-                        assert await asyncio.to_thread(router.started.wait, 2.0)
+                        assert await asyncio.to_thread(router.started.wait, 10.0)
                         task.cancel()
                         with pytest.raises(asyncio.CancelledError):
                             await task
                         # A reaper can now queue behind the still-running forward pass.
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(1.5)
                         assert not router.unloaded.is_set()
                         router.release.set()
-                        assert await asyncio.to_thread(router.finished.wait, 2.0)
-                        assert not await asyncio.to_thread(router.unloaded.wait, 0.1)
-                        assert await asyncio.to_thread(router.unloaded.wait, 2.0)
+                        assert await asyncio.to_thread(router.finished.wait, 10.0)
+                        assert not await asyncio.to_thread(router.unloaded.wait, 0.5)
+                        assert await asyncio.to_thread(router.unloaded.wait, 10.0)
                     finally:
                         router.release.set()
         asyncio.run(exercise())
@@ -3861,13 +3863,13 @@ def test_idle_window_starts_after_worker_finishes_even_on_cancel_or_failure(monk
         with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as callers:
             request = callers.submit(client.post, path, json=body)
             try:
-                assert router.started.wait(2.0)
-                time.sleep(0.3)
+                assert router.started.wait(10.0)
+                time.sleep(1.5)
                 assert not router.unloaded.is_set()
                 router.release.set()
-                assert request.result(timeout=2.0).status_code == (422 if fail else 200)
-                assert not router.unloaded.wait(0.1)
-                assert router.unloaded.wait(2.0)
+                assert request.result(timeout=10.0).status_code == (422 if fail else 200)
+                assert not router.unloaded.wait(0.5)
+                assert router.unloaded.wait(10.0)
             finally:
                 router.release.set()
 

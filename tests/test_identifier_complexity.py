@@ -118,8 +118,12 @@ for label, text in (("hyphens", "a-" * 10_000),
 
 # Scaling, which is machine-independent in a way a wall-clock ceiling is not: linear work
 # quadruples with the input, quadratic work grows sixteenfold. 8 sits between the two.
-small = min(elapsed(_IDENTIFIER.sub, " ", "a" * 5_000) for _ in range(3))
-large = min(elapsed(_IDENTIFIER.sub, " ", "a" * 20_000) for _ in range(3))
+# Each side is the best of many interleaved runs: the small case takes ~0.1 ms, so on a
+# loaded machine one preemption in a best-of-3 was enough to push the ratio past 13.
+small = large = float("inf")
+for _ in range(25):
+    small = min(small, elapsed(_IDENTIFIER.sub, " ", "a" * 5_000))
+    large = min(large, elapsed(_IDENTIFIER.sub, " ", "a" * 20_000))
 ratio = large / small if small > 0 else 0
 ok("4x the input costs under 8x the time, ratio %.1f (linear ~4, quadratic ~16)" % ratio,
    ratio < 8, "ratio %.1f  (%.2f ms -> %.2f ms)" % (ratio, small * 1000, large * 1000))
